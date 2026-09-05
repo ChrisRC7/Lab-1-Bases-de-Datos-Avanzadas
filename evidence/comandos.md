@@ -1,48 +1,108 @@
 # Bitácora Laboratorio 1
-¿Por qué se define primero una región primaria?
-Aqui va la respuesta
-¿Qué comando prueba la configuración resultante?
-Aqui va la respuesta
-¿Agregar una región crea latencia WAN real?
-Aqui va la otra respuesta
+
+## Pasos 0 y 1: preparación y clúster
+
+- Servicios: `crdb-1`, `crdb-2` y `crdb-3`.
+- Localidades: `crdb-1 = region=cr-sj,zone=a`, `crdb-2 = region=cr-limon,zone=a`, `crdb-3 = region=us-east,zone=a`.
+- Los tres nodos usan `--join=crdb-1,crdb-2,crdb-3` y un volumen persistente independiente (`crdb1`, `crdb2`, `crdb3`).
+- `node-status-initial.txt` confirma tres nodos disponibles y vivos.
+
+`--join` solo permite que los procesos encuentren y formen el clúster inicial; no configura una base multi-región. `--locality` asigna una etiqueta lógica. Si se eliminan los volúmenes, se pierde el estado persistente del clúster, incluidas regiones, tablas y datos.
+
+## Paso 3: regiones
+
+```sql
+ALTER DATABASE ti4601 PRIMARY REGION "cr-sj";
+ALTER DATABASE ti4601 ADD REGION "cr-limon";
+ALTER DATABASE ti4601 ADD REGION "us-east";
+SHOW REGIONS FROM DATABASE ti4601;
+SELECT gateway_region();
+```
 
 
-Paso 4
-ti4601=> SHOW CREATE TABLE catalogo_producto;
-    table_name     |                             create_statement                             
--------------------+--------------------------------------------------------------------------
- catalogo_producto | CREATE TABLE public.catalogo_producto (                                 +
-                   |         producto_id UUID NOT NULL DEFAULT gen_random_uuid(),            +
-                   |         sku STRING NOT NULL,                                            +
-                   |         nombre STRING NOT NULL,                                         +
-                   |         precio DECIMAL(12,2) NOT NULL,                                  +
-                   |         CONSTRAINT catalogo_producto_pkey PRIMARY KEY (producto_id ASC),+
-                   |         UNIQUE INDEX catalogo_producto_sku_key (sku ASC),               +
-                   |         CONSTRAINT check_precio CHECK (precio >= 0:::DECIMAL)           +
-                   | ) LOCALITY GLOBAL
-(1 row)
+Resultado : `cr-sj`, `cr-limon` y `us-east`.
 
-ti4601=> SHOW CREATE TABLE pedido;
- table_name |                                                    create_statement                                                    
-------------+------------------------------------------------------------------------------------------------------------------------
- pedido     | CREATE TABLE public.pedido (                                                                                          +
-            |         region public.crdb_internal_region NOT NULL,                                                                  +
-            |         pedido_id UUID NOT NULL DEFAULT gen_random_uuid(),                                                            +
-            |         producto_id UUID NOT NULL,                                                                                    +
-            |         tienda STRING NOT NULL,                                                                                       +
-            |         estado STRING NOT NULL DEFAULT 'CREADO':::STRING,                                                             +
-            |         monto DECIMAL(12,2) NOT NULL,                                                                                 +
-            |         version INT8 NOT NULL DEFAULT 0:::INT8,                                                                       +
-            |         creado_en TIMESTAMPTZ NOT NULL DEFAULT now():::TIMESTAMPTZ,                                                   +
-            |         CONSTRAINT pedido_pkey PRIMARY KEY (region ASC, pedido_id ASC),                                               +
-            |         CONSTRAINT pedido_producto_id_fkey FOREIGN KEY (producto_id) REFERENCES public.catalogo_producto(producto_id),+
-            |         CONSTRAINT check_monto CHECK (monto >= 0:::DECIMAL)                                                           +
-            | ) LOCALITY REGIONAL BY ROW AS region
-(1 row)
+**Paso 3: OK.**
+
+## Paso 4: esquema
+
+Se aplicó `schema.sql` y se verificó con `SHOW CREATE TABLE`:
+
+```text
+catalogo_producto: LOCALITY GLOBAL
+pedido: LOCALITY REGIONAL BY ROW AS region
+```
+
+`pedido.region` determina la región hogar y forma parte de la clave primaria `(region, pedido_id)`. `GLOBAL` es apropiada para el catálogo pequeño; RBR aproxima la fragmentación horizontal por región. Las copias físicas siguen siendo réplicas Raft, por lo que RBR y replicación no son el mismo concepto.
+
+**Paso 4: OK.**
+
+## Paso 5: seed
+
+Se aplicó `seed.sql`. El resultado es una fila de `pedido` por región: `cr-sj`, `cr-limon` y `us-east`. El catálogo contiene `SKU-CAFE` y `SKU-CACAO`.
+
+**Paso 5: OK.**
+
+## Paso 6: tabla Raft
+
+Se aplicó `raft_probe.sql`. La tabla `ti4601_raft.public.raft_probe` tiene una fila `id=1`, factor de replicación 3 y tres votantes. En la precondición de Chaos A el rango fue `76`, el leaseholder fue el nodo `3` (`cr-limon`) y los votantes fueron `{1,3,2}`.
+
+**Paso 6: OK.**
+
+## Paso 7: verificación
+
+`verify_cluster.py` terminó con seis comprobaciones correctas:
+
+```text
+[ OK ] tres nodos/localities vivos
+[ OK ] tres regiones configuradas
+[ OK ] catalogo_producto es GLOBAL
+[ OK ] pedido es REGIONAL BY ROW
+[ OK ] hay una fila pedido por región
+[ OK ] raft_probe tiene tres votantes
+Resultado: 6/6 verificaciones.
+```
+
+**Paso 7: OK.**
+
+## Paso 8: inspección
+
+`cluster-inspect.txt` consolida las seis consultas exigidas: regiones, DDL de `pedido`, conteo por región, configuración de zona, rangos de `pedido` y rango/votantes/localidades de `raft_probe`. La salida literal de `SHOW ZONE CONFIGURATION` y `SHOW RANGES FROM TABLE pedido` no se conservó en la captura original y está identificada como tal en ese archivo.
+
+**Paso 8: evidencia consolidada, pero falta recapturar literalmente dos consultas.**
+
+## Paso 9: latencia
+
+Se ejecutó desde `crdb-1`, con warm-up de 5 y `n=50` por caso, para 200 muestras totales (201 líneas con cabecera):
+
+```text
+operation locality home_region n p50_ms p99_ms
+read      local    cr-sj       50 0.690  1.934
+read      remote   cr-limon    50 1.460  1.698
+write     local    cr-sj       50 7.067 12.713
+write     remote   cr-limon    50 6.072 11.792
+```
+
+Las regiones son lógicas. Se mantuvieron constantes la máquina, los recursos y el número de ejecuciones. No se puede inferir el costo de una WAN real porque no hubo latencia física controlada; por eso remoto puede ser parecido o incluso menor que local.
+
+**Paso 9: OK.**
+
+## Escenario A: falla y recuperación
+
+Se movió el lease de `raft_probe` al store `3`, correspondiente a `crdb-2` en `region=cr-limon`, y se detuvo ese nodo. Antes de la falla la versión observada era `0` y había tres votantes. Después hubo 2 errores transitorios `QueryCanceled` por el timeout de 2 segundos; luego las escrituras volvieron a confirmar con dos nodos de tres.
+
+```text
+stop_epoch                 = 1788370667.521754
+first after-stop ok        = 1788370671.559400 completed_epoch
+RTO                       = (1788370671.559400 - 1788370667.521754) * 1000
+RTO observado             = 4037.6 ms
+```
+
+El RPO observado para operaciones confirmadas es 0: no se perdió ni retrocedió el estado confirmado. La consulta posterior conserva `id=1` con `version=112`; los intentos con error no se cuentan como commits perdidos. `chaos-a-node-status.txt` confirma que los tres nodos fueron restaurados y están vivos.
+
+## Escenario B: pérdida de quórum
+
+En la evidencia opcional muestra 5 errores mientras estuvieron detenidos `crdb-2` y `crdb-3`, seguidos de escrituras correctas tras restaurarlos. Con un solo nodo activo queda 1/3, menor que la mayoría de 2/3, por lo que no se puede confirmar una escritura. Los procesos detenidos no constituyen una partición de red.
 
 
-Paso 9:
-que las regiones son lógicas;
-que la máquina, los recursos disponibles y el número de ejecuciones se mantuvieron constantes;
-que inferir el costo WAN requeriría latencia controlada, ausente hoy.
 
