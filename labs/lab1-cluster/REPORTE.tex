@@ -1,0 +1,235 @@
+\documentclass[10pt,letterpaper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish,es-noquoting]{babel}
+\usepackage{lmodern}
+\usepackage[margin=1.9cm,top=1.5cm,bottom=1.6cm]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+
+\definecolor{acc}{HTML}{1F4E79}
+\definecolor{gris}{HTML}{5B6672}
+
+\setlength{\parskip}{2pt}
+\setlength{\topsep}{2pt}
+\setlength{\partopsep}{0pt}
+\setlength{\parindent}{0pt}
+\renewcommand{\arraystretch}{1.05}
+
+% Secciones y pie de pagina sin paquetes externos: solo LaTeX base.
+\makeatletter
+\renewcommand\section{\@startsection{section}{1}{\z@}%
+  {7pt \@plus 2pt \@minus 1pt}{3pt}%
+  {\normalfont\normalsize\bfseries\color{acc}}}
+\renewcommand\@seccntformat[1]{\csname the#1\endcsname.\quad}
+\renewcommand{\ps@plain}{%
+  \renewcommand{\@oddhead}{}\renewcommand{\@evenhead}{}%
+  \renewcommand{\@oddfoot}{\footnotesize\color{gris}%
+    TI-4601 $\cdot$ Laboratorio 1 $\cdot$ Cl\'uster CockroachDB, localidad y qu\'orum
+    \hfill \thepage}%
+  \renewcommand{\@evenfoot}{\@oddfoot}}
+\makeatother
+\pagestyle{plain}
+
+\newcommand{\nodo}[3]{%
+  \fbox{\parbox[t][1.35cm][c]{0.29\textwidth}{\centering
+    \textbf{#1}\\[2pt]
+    {\ttfamily\footnotesize #2}\\[2pt]
+    {\footnotesize\color{gris}\itshape #3}}}}
+
+\begin{document}
+
+{\LARGE\bfseries\color{acc} Laboratorio 1 --- Clúster CockroachDB, localidad y quórum}\\[2pt]
+{\footnotesize\color{gris} TI-4601 Bases de Datos Avanzadas $\cdot$ Grupo 3 $\cdot$ Fabricio Mena $\cdot$ Christopher 	Rodriguez $\cdot$ Alisson Redondo}
+
+\vspace{4pt}\hrule\vspace{6pt}
+
+\section{Nodos, localidades, \texttt{-{}-join} y \texttt{-{}-locality}}
+
+\begin{center}
+\nodo{crdb-1}{region=cr-sj}{SQL 26257 / UI 8080}\hfill
+\nodo{crdb-2}{region=cr-limon}{sin puertos publicados}\hfill
+\nodo{crdb-3}{region=us-east}{sin puertos publicados}
+\end{center}
+\vspace{-4pt}
+\begin{center}
+{\footnotesize\color{gris} Los tres con \texttt{-{}-join=crdb-1,crdb-2,crdb-3} y \texttt{zone=a};
+volúmenes \texttt{crdb1}, \texttt{crdb2}, \texttt{crdb3}. Una sola computadora: las tres regiones son
+localidades lógicas, no una WAN.}
+\end{center}
+
+\textbf{\texttt{-{}-join}} es la lista con la que los tres procesos se encuentran y forman un solo
+clúster; no declara regiones. Tras \texttt{make lab1-up} los tres nodos aparecen vivos en
+\texttt{node-status-initial.txt}, pero \texttt{SHOW REGIONS FROM DATABASE ti4601} no devuelve nada
+hasta ejecutar el Paso 3: formar el clúster y configurar la base multi-región son cosas distintas.
+
+\textbf{\texttt{-{}-locality}} es una etiqueta lógica, el par \texttt{region=...,zone=...}.
+CockroachDB la usa para colocar réplicas y para resolver \texttt{REGIONAL BY ROW} y \texttt{GLOBAL},
+pero el nombre no crea distancia: etiqueta no es WAN física. Borrar los volúmenes costaría el
+almacenamiento estable que Raft supone --- término actual, voto del término y log replicado ---
+además de regiones, tablas y datos.
+
+\section{Regiones, esquema y semilla}
+
+{\footnotesize
+\begin{verbatim}
+ALTER DATABASE ti4601 PRIMARY REGION "cr-sj";   ALTER DATABASE ti4601 ADD REGION "cr-limon";
+ALTER DATABASE ti4601 ADD REGION "us-east";     SHOW REGIONS FROM DATABASE ti4601;
+\i labs/lab1-cluster/schema.sql    \i labs/lab1-cluster/seed.sql    \i labs/lab1-cluster/raft_probe.sql
+\end{verbatim}}
+\vspace{2pt}
+
+Cockroach generó \texttt{LOCALITY GLOBAL} para \texttt{catalogo\_producto} y
+\texttt{LOCALITY REGIONAL BY ROW AS region} para \texttt{pedido}. \texttt{make lab1-check} terminó
+en \texttt{6/6} (\texttt{config-check.txt}).
+
+\textbf{Decisión 1: \texttt{region} va primero en la clave primaria de \texttt{pedido}.}
+\texttt{REGIONAL BY ROW AS region} reparte las filas por esa columna. Al ir primero en
+\texttt{PRIMARY KEY (region, pedido\_id)}, las filas de una región quedan juntas y esa región puede
+ser su hogar. El costo es que una consulta que no filtre por \texttt{region} puede producir
+\emph{scatter}.
+
+\textbf{Decisión 2: \texttt{catalogo\_producto} es \texttt{GLOBAL}, no \texttt{REGIONAL BY ROW}.}
+Es el catálogo pequeño que se quiere leer desde las tres regiones. \texttt{GLOBAL} da esa lectura
+en todas ellas; el precio es que la lectura global tiene costo de escritura. Con
+\texttt{REGIONAL BY ROW} habría que elegir una sola región hogar.
+
+\section{Réplica Raft frente a fragmentación y asignación}
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}p{0.30\textwidth}p{0.32\textwidth}p{0.31\textwidth}@{}}
+\toprule
+\textbf{Diseño de fragmentación} & \textbf{En CockroachDB} & \textbf{No confundir} \\
+\midrule
+Fragmentación horizontal primaria por región & \texttt{pedido}: \texttt{REGIONAL BY ROW AS region} & hogar de fila $\neq$ consenso \\
+Catálogo pequeño replicado & \texttt{catalogo\_producto}: \texttt{GLOBAL} & lectura global tiene costo de write \\
+Sitio / región & \texttt{-{}-locality=region=...} & etiqueta $\neq$ WAN física \\
+Réplica selectiva & política de colocación & réplica Raft copia un rango \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Fragmentar y asignar son decisiones de diseño sobre relaciones: qué filas existen y en qué sitio
+viven. Una réplica Raft es otra cosa: una copia de un \textbf{rango}, mantenida por un grupo de
+consenso para sobrevivir a la caída de un nodo. Son fenómenos distintos en el mismo clúster.
+\texttt{ti4601\_raft.public.raft\_probe} no usa localidad multirregional y aun así tiene tres
+réplicas votantes; por eso la disponibilidad del §5 no debe atribuirse a \texttt{REGIONAL BY ROW}.
+
+\textbf{Varios rangos implican varios grupos Raft.} El motor parte el espacio de claves en rangos y
+cada rango tiene sus propias réplicas, su líder Raft y su leaseholder: es una máquina de estados
+replicada independiente. En \texttt{cluster-inspect.txt}, \texttt{raft\_probe} ocupa el rango
+\texttt{76} con sus votantes \texttt{\{1,3,2\}}; las filas de \texttt{pedido} viven en otros rangos,
+con sus propios grupos. El paper explica un log; el motor ejecuta muchos (Multi-Raft), y una
+consulta puede tocar varios rangos.
+
+\textbf{Límite de este clúster.} \texttt{REGIONAL BY ROW} espera varios nodos por región y aquí hay
+uno, así que algunos rangos de \texttt{pedido} pueden aparecer subreplicados: la evidencia demuestra
+región hogar y localidad configurada, no residencia estricta.
+
+\section{Latencia: p50 y p99 de los cuatro casos}
+
+Gateway fijo \texttt{crdb-1}, warm-up de 5 descartado por caso y \texttt{n=50} muestras por caso
+(200 en total; \texttt{latency.csv} tiene 201 líneas). El reloj es
+\texttt{time.perf\_counter\_ns()} y el p99 usa \emph{nearest rank}.
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}llcrrr@{}}
+\toprule
+\textbf{operation} & \textbf{locality} & \textbf{home\_region} & \textbf{n} & \textbf{p50\_ms} & \textbf{p99\_ms} \\
+\midrule
+read  & local  & cr-sj    & 50 & 0.690 & 1.934 \\
+read  & remote & cr-limon & 50 & 1.460 & 1.698 \\
+write & local  & cr-sj    & 50 & 7.067 & 12.713 \\
+write & remote & cr-limon & 50 & 6.072 & 11.792 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Lo medido se reporta tal cual. En escrituras el caso remoto salió incluso por debajo del local:
+resultado válido, porque Docker no añade distancia física y la razón local/remoto puede quedar cerca
+de 1 o invertirse por ruido. La diferencia clara está entre lectura y escritura, no entre local y
+remoto.
+
+\textbf{Declaración obligatoria.} (i) Las tres regiones son lógicas. (ii) La máquina, los recursos
+disponibles y el número de ejecuciones se mantuvieron constantes. (iii) Inferir el costo de una WAN
+requeriría latencia controlada, ausente hoy.
+
+\section{Escenario A: falla de un nodo, RTO y RPO}
+
+\textbf{Precondición} (\texttt{chaos-a-before.txt}). El rango \texttt{76} de \texttt{raft\_probe}
+tenía \texttt{voting\_replicas \{1,3,2\}}, una por nodo. El lease se movió al nodo que se iba a
+detener con \texttt{ALTER RANGE RELOCATE LEASE TO 3} (el \texttt{store\_id} de
+\texttt{region=cr-limon}), y quedó con \texttt{lease\_holder = 3}. Ese \texttt{node 3} es el
+contenedor \texttt{ti4601-crdb-2}: se detuvo el leaseholder, no un follower. El valor confirmado antes
+de la falla era \texttt{version = 0}.
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Instante (UTC)} & \textbf{Evento} & \textbf{Fuente} \\
+\midrule
+17:37:40.543 -- 17:37:47.039 & 14 escrituras \texttt{before-stop ok} & \texttt{chaos-a.csv} \\
+\textbf{17:37:47.5218} & \texttt{docker stop -{}-timeout 0 ti4601-crdb-2} & \texttt{chaos-a-stop.epoch} \\
+17:37:49.539 & \texttt{after-stop error} 2007.6 ms & \texttt{chaos-a.csv} \\
+17:37:51.549 & \texttt{after-stop error} 2009.2 ms & \texttt{chaos-a.csv} \\
+\textbf{17:37:51.5594} & \textbf{primer \texttt{after-stop ok}}, 10.235 ms & \texttt{chaos-a.csv} \\
+17:37:59.472 & \texttt{crdb-2} vuelve a estar arriba & \texttt{chaos-a-node-status.txt} \\
+17:38:10.055 & lectura posterior: \texttt{version = 112} & \texttt{chaos-a-rpo.txt} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{RTO observado.} Se toma el instante de falla de \texttt{chaos-a-stop.epoch} y la columna
+\texttt{completed\_epoch} de la primera fila con \texttt{phase=after-stop} y \texttt{status=ok}:
+
+{\footnotesize
+\begin{verbatim}
+RTO = (1788370671.559400 - 1788370667.521754) x 1000 = 4037.646 ms  ->  4037.6 ms
+\end{verbatim}}
+\vspace{2pt}
+
+La sonda imprimió \texttt{4037.6 ms}: el mismo cálculo, redondeado a un decimal.
+
+\textbf{Errores transitorios: 2}, ambos \texttt{QueryCanceled} por el \texttt{statement\_timeout}
+de 2 s de la sonda. Son intentos sin confirmación, de resultado desconocido; no se contabilizan
+como operaciones confirmadas perdidas.
+
+\textbf{RPO observado para operaciones confirmadas: 0.} \texttt{version} solo se incrementa. El
+valor confirmado antes de la falla no retrocedió: la lectura posterior a la recuperación devuelve
+\texttt{version = 112}, mayor que el valor previo, y \texttt{make lab1-status} muestra los tres
+nodos con \texttt{is\_live = true}.
+
+\section{Mayoría de 2 de 3}
+
+Con tres votantes la mayoría es 2, porque dos mayorías cualesquiera comparten al menos un servidor.
+Esa intersección es la que hace que un write committed sobreviva: el próximo líder necesita votos de
+una mayoría, y esa mayoría contiene a alguien que ya tiene la entrada. Mayoría no significa muchas
+copias; significa intersección.
+
+La evidencia del §5 lo muestra: las escrituras volvieron a confirmar a las 17:37:51.56 y
+\texttt{crdb-2} no regresó sino hasta las 17:37:59.47. Las 38 escrituras \texttt{after-stop ok} se
+confirmaron con dos nodos de tres, no porque el nodo caído volviera.
+
+Con dos nodos caídos queda un proceso activo pero 1 de 3, menos que la mayoría: sigue vivo y acepta
+la conexión, pero no puede reunir mayoría para elegir líder ni para avanzar \texttt{commitIndex}, así
+que la escritura no debe confirmarse. Proceso activo no es lo mismo que quórum.
+
+\section{Puente al Proyecto 1}
+
+Se reutiliza el método, no los artefactos: Compose y la imagen cliente, las variables \texttt{PG*},
+\texttt{SHOW REGIONS}, \texttt{SHOW CREATE} y \texttt{SHOW RANGES}, las definiciones de p50, p99,
+RTO y RPO, y la estructura precondición $\rightarrow$ evento $\rightarrow$ medición $\rightarrow$
+verificación. Entregar este DDL renombrado no cumple el P1.
+
+Queda pendiente y es trabajo propio del equipo: el dominio del E1 con sus predicados, claves y
+localidades, y su propia tabla \texttt{REGIONAL BY ROW} y su candidato a \texttt{GLOBAL}; un script
+reproducible de configuración, porque aquí se aplicó a mano en \texttt{psql}; un seed y un generador
+de carga propios; un programa que mida operaciones representativas del dominio; una tabla operacional
+propia con RF=3 para el E4, distinta de \texttt{raft\_probe}; la orquestación de la falla y su
+evidencia; y el contraste del E5 contra un nodo o el Lab 0. Los límites que deben declararse: las
+regiones son lógicas, los rangos \texttt{REGIONAL BY ROW} pueden quedar subreplicados con un nodo por
+región, y de este Compose no se sigue ninguna afirmación sobre residencia de los datos.
+
+\end{document}

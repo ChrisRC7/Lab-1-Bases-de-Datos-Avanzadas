@@ -20,7 +20,21 @@ SELECT gateway_region();
 ```
 
 
-Resultado : `cr-sj`, `cr-limon` y `us-east`.
+Resultado: `cr-sj` (primaria), `cr-limon` y `us-east`. `gateway_region()` devolvió `cr-sj`,
+la región del nodo que atendió la conexión.
+
+**¿Por qué se define primero una región primaria?**
+`PRIMARY REGION` es la sentencia que convierte la base en multi-región: crea el tipo
+`crdb_internal_region` y fija la región por defecto. Sin ella no hay a qué agregar regiones,
+y `schema.sql` fallaría al declarar `region crdb_internal_region`.
+
+**¿Qué comando prueba la configuración resultante?**
+`SHOW REGIONS FROM DATABASE ti4601`, que debe listar tres filas con `cr-sj` marcada como
+primaria. `make lab1-check` lo comprueba de forma automática (`config-check.txt`).
+
+**¿Agregar una región crea latencia WAN real?**
+No. `ADD REGION` habilita colocación y ruteo sobre localidades ya declaradas en
+`--locality`. Las tres regiones siguen corriendo en una sola computadora.
 
 **Paso 3: OK.**
 
@@ -73,6 +87,14 @@ Resultado: 6/6 verificaciones.
 
 ## Paso 9: latencia
 
+Lectura previa de `measure_latency.py`:
+
+1. los cuatro casos son `read/write` × `local/remote`, sobre las filas hogar `cr-sj` y `cr-limon`;
+2. el warm-up se ejecuta antes del bucle de muestras y sus tiempos no se guardan;
+3. el reloj de cada observación es `time.perf_counter_ns()`;
+4. p50 es la mediana y p99 se calcula por *nearest rank*;
+5. las columnas del CSV son `operation, locality, home_region, run, latency_ms`.
+
 Se ejecutó desde `crdb-1`, con warm-up de 5 y `n=50` por caso, para 200 muestras totales (201 líneas con cabecera):
 
 ```text
@@ -97,6 +119,8 @@ first after-stop ok        = 1788370671.559400 completed_epoch
 RTO                       = (1788370671.559400 - 1788370667.521754) * 1000
 RTO observado             = 4037.6 ms
 ```
+
+La sonda imprimió `RTO observado hasta primer write OK: 4037.6 ms`, el mismo valor: la sonda usa las mismas dos marcas del CSV y solo redondea a un decimal.
 
 El RPO observado para operaciones confirmadas es 0: no se perdió ni retrocedió el estado confirmado. La consulta posterior conserva `id=1` con `version=112`; los intentos con error no se cuentan como commits perdidos. `chaos-a-node-status.txt` confirma que los tres nodos fueron restaurados y están vivos.
 
